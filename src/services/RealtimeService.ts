@@ -26,6 +26,8 @@ export class RealtimeService extends BaseService {
         200, 300, 500, 1000, 1200, 1500, 2000,
     ];
     private pendingConnects: Array<promiseCallbacks> = [];
+    private pendingSubmits: Array<promiseCallbacks> = [];
+    private isProcessingPendingSubmits: boolean = false;
 
     /**
      * Returns whether the realtime connection has been established.
@@ -124,8 +126,6 @@ export class RealtimeService extends BaseService {
      * unsubscribe operation there are no active subscriptions left.
      */
     async unsubscribe(topic?: string): Promise<void> {
-        let needToSubmit = false;
-
         if (!topic) {
             // remove all subscriptions
             this.subscriptions = {};
@@ -141,20 +141,10 @@ export class RealtimeService extends BaseService {
                     this.eventSource?.removeEventListener(key, listener);
                 }
                 delete this.subscriptions[key];
-
-                // mark for subscriptions change submit if there are no other listeners
-                if (!needToSubmit) {
-                    needToSubmit = true;
-                }
             }
         }
 
-        if (!this.hasSubscriptionListeners()) {
-            // no other active subscriptions -> close the sse connection
-            this.disconnect();
-        } else if (needToSubmit) {
-            await this.submitSubscriptions();
-        }
+        await this.submitSubscriptions();
     }
 
     /**
@@ -184,13 +174,7 @@ export class RealtimeService extends BaseService {
             return; // nothing to unsubscribe from
         }
 
-        if (this.hasSubscriptionListeners()) {
-            // submit the deleted subscriptions
-            await this.submitSubscriptions();
-        } else {
-            // no other active subscriptions -> close the sse connection
-            this.disconnect();
-        }
+        await this.submitSubscriptions();
     }
 
     /**
@@ -206,8 +190,6 @@ export class RealtimeService extends BaseService {
         topic: string,
         listener: EventListener,
     ): Promise<void> {
-        let needToSubmit = false;
-
         const subs = this.getSubscriptionsByTopic(topic);
         for (let key in subs) {
             if (
@@ -236,19 +218,9 @@ export class RealtimeService extends BaseService {
             if (!this.subscriptions[key].length) {
                 delete this.subscriptions[key];
             }
-
-            // mark for subscriptions change submit if there are no other listeners
-            if (!needToSubmit && !this.hasSubscriptionListeners(key)) {
-                needToSubmit = true;
-            }
         }
 
-        if (!this.hasSubscriptionListeners()) {
-            // no other active subscriptions -> close the sse connection
-            this.disconnect();
-        } else if (needToSubmit) {
-            await this.submitSubscriptions();
-        }
+        await this.submitSubscriptions();
     }
 
     private hasSubscriptionListeners(keyToCheck?: string): boolean {
@@ -270,30 +242,47 @@ export class RealtimeService extends BaseService {
     }
 
     private async submitSubscriptions(): Promise<void> {
-        if (!this.clientId) {
-            return; // no client/subscriber
+        return new Promise((resolve, reject) => {
+            this.pendingSubmits.push({ resolve, reject });
+
+            if (this.pendingSubmits.length == 1) {
+                queueMicrotask(() => this.finalizePendingSubscriptions());
+            }
+        });
+    }
+
+    private async finalizePendingSubscriptions() {
+        if (
+            this.isProcessingPendingSubmits ||
+            !this.pendingSubmits.length
+        ) {
+            return;
         }
 
-        // optimistic update
-        this.addAllSubscriptionListeners();
+        // clone and reset the list to allow next items to queue
+        const pending = this.pendingSubmits.slice();
+        this.pendingSubmits = [];
 
-        this.lastSentSubscriptions = this.getNonEmptySubscriptionKeys();
+        this.isProcessingPendingSubmits = true;
 
-        return this.client
-            .send("/api/realtime", {
-                method: "POST",
-                body: {
-                    clientId: this.clientId,
-                    subscriptions: this.lastSentSubscriptions,
-                },
-                requestKey: this.getSubscriptionsCancelKey(),
-            })
-            .catch((err) => {
-                if (err?.isAbort) {
-                    return; // silently ignore aborted pending requests
-                }
-                throw err;
-            });
+        try {
+            await this.sendSubscriptions();
+
+            for (let p of pending) {
+                p.resolve();
+            }
+        } catch (err) {
+            for (let p of pending) {
+                err ? p.reject(err) : p.resolve();
+            }
+        } finally {
+            this.isProcessingPendingSubmits = false;
+
+            // another request came in while awaiting above
+            if (this.pendingSubmits.length > 0) {
+              await this.finalizePendingSubscriptions();
+            }
+        }
     }
 
     private getSubscriptionsCancelKey(): string {
@@ -325,6 +314,58 @@ export class RealtimeService extends BaseService {
         }
 
         return result;
+    }
+
+    private hasUnsentSubscriptions(): boolean {
+        const latestTopics = this.getNonEmptySubscriptionKeys();
+        if (latestTopics.length != this.lastSentSubscriptions.length) {
+            return true;
+        }
+
+        for (const t of latestTopics) {
+            if (!this.lastSentSubscriptions.includes(t)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async sendSubscriptions(): Promise<void> {
+        // not initialized yet or connection closed
+        if (!this.clientId) {
+            return;
+        }
+
+        // no subscriptions -> close the SSE connection
+        if (!this.hasSubscriptionListeners()) {
+            return this.disconnect();
+        }
+
+        // no change
+        if (!this.hasUnsentSubscriptions()) {
+            return;
+        }
+
+        // optimistic update
+        this.addAllSubscriptionListeners();
+        this.lastSentSubscriptions = this.getNonEmptySubscriptionKeys();
+
+        return this.client
+            .send("/api/realtime", {
+                method: "POST",
+                body: {
+                    clientId: this.clientId,
+                    subscriptions: this.lastSentSubscriptions,
+                },
+                requestKey: this.getSubscriptionsCancelKey(),
+            })
+            .catch((err) => {
+                if (err?.isAbort) {
+                    return; // silently ignore aborted pending requests
+                }
+                throw err;
+            });
     }
 
     private addAllSubscriptionListeners(): void {
@@ -363,12 +404,9 @@ export class RealtimeService extends BaseService {
         return new Promise((resolve, reject) => {
             this.pendingConnects.push({ resolve, reject });
 
-            if (this.pendingConnects.length > 1) {
-                // all promises will be resolved once the connection is established
-                return;
+            if (this.pendingConnects.length == 1) {
+                queueMicrotask(() => this.initConnect());
             }
-
-            this.initConnect();
         });
     }
 
@@ -392,20 +430,9 @@ export class RealtimeService extends BaseService {
         this.eventSource.addEventListener("PB_CONNECT", (e) => {
             const msgEvent = e as MessageEvent;
             this.clientId = msgEvent?.lastEventId;
+            this.lastSentSubscriptions = [];
 
             this.submitSubscriptions()
-                .then(async () => {
-                    let retries = 3;
-                    while (this.hasUnsentSubscriptions() && retries > 0) {
-                        retries--;
-                        // resubscribe to ensure that the latest topics are submitted
-                        //
-                        // This is needed because missed topics could happen on reconnect
-                        // if after the pending sent `submitSubscriptions()` call another `subscribe()`
-                        // was made before the submit was able to complete.
-                        await this.submitSubscriptions();
-                    }
-                })
                 .then(() => {
                     for (let p of this.pendingConnects) {
                         p.resolve();
@@ -427,24 +454,10 @@ export class RealtimeService extends BaseService {
                 })
                 .catch((err) => {
                     this.clientId = "";
+                    this.lastSentSubscriptions = [];
                     this.connectErrorHandler(err);
                 });
         });
-    }
-
-    private hasUnsentSubscriptions(): boolean {
-        const latestTopics = this.getNonEmptySubscriptionKeys();
-        if (latestTopics.length != this.lastSentSubscriptions.length) {
-            return true;
-        }
-
-        for (const t of latestTopics) {
-            if (!this.lastSentSubscriptions.includes(t)) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private connectErrorHandler(err: any) {
@@ -490,6 +503,7 @@ export class RealtimeService extends BaseService {
         this.eventSource?.close();
         this.eventSource = null;
         this.clientId = "";
+        this.lastSentSubscriptions = [];
 
         if (!fromReconnect) {
             this.reconnectAttempts = 0;
